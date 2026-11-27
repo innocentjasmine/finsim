@@ -117,6 +117,10 @@ public class FaultService {
   }
 
   public FaultDecision evaluateOutboundCall(String targetInstitution) {
+    return evaluateOutboundCall(targetInstitution, null);
+  }
+
+  public FaultDecision evaluateOutboundCall(String targetInstitution, String stage) {
     if (targetInstitution == null || targetInstitution.isBlank()) {
       return FaultDecision.none();
     }
@@ -125,7 +129,7 @@ public class FaultService {
     for (int attempt = 0; attempt < MAX_EVALUATION_ATTEMPTS; attempt++) {
       try {
         Optional<FaultDecision> outcome =
-            transactionOperations.execute(status -> evaluateOnce(normalizedTarget));
+            transactionOperations.execute(status -> evaluateOnce(normalizedTarget, stage));
         if (outcome != null && outcome.isPresent()) {
           return outcome.get();
         }
@@ -137,7 +141,7 @@ public class FaultService {
     return FaultDecision.none();
   }
 
-  private Optional<FaultDecision> evaluateOnce(String target) {
+  private Optional<FaultDecision> evaluateOnce(String target, String stage) {
     List<FaultRuleEntity> entities = repository.findByTargetInstitutionIgnoreCase(target);
     List<FaultRule> activeRules =
         entities.stream().filter(FaultRuleEntity::isActive).map(FaultRuleEntity::toDomain).toList();
@@ -146,7 +150,7 @@ public class FaultService {
       return Optional.of(FaultDecision.none());
     }
 
-    FaultEvaluator.EvaluationResult result = evaluator.evaluate(activeRules, target);
+    FaultEvaluator.EvaluationResult result = evaluator.evaluate(activeRules, target, stage);
     if (result.decision().triggered() && result.updatedRule().isPresent()) {
       FaultRule updated = result.updatedRule().get();
       if (updated.remainingCount() != null) {

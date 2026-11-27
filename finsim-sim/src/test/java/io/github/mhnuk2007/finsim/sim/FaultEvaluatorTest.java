@@ -169,4 +169,48 @@ class FaultEvaluatorTest {
     assertThat(totalTriggered.get()).isEqualTo(initialCount);
     assertThat(remaining.get()).isEqualTo(0);
   }
+
+  @Test
+  void evaluatesStageTargetedRulesAndResponseLostBehavior() {
+    FaultRule creditOnly =
+        new FaultRule(
+            "r-credit",
+            "bank-b",
+            FaultType.TIMEOUT,
+            null,
+            1.0,
+            1,
+            42L,
+            "CREDIT",
+            FaultBehavior.RESPONSE_LOST_AFTER_PROCESSING);
+
+    assertThat(
+            evaluator
+                .evaluate(List.of(creditOnly), "bank-b", "debit_source")
+                .decision()
+                .triggered())
+        .isFalse();
+    assertThat(evaluator.evaluate(List.of(creditOnly), "bank-b", null).decision().triggered())
+        .isFalse();
+
+    FaultEvaluator.EvaluationResult creditHit =
+        evaluator.evaluate(List.of(creditOnly), "bank-b", "credit_destination");
+    assertThat(creditHit.decision().triggered()).isTrue();
+    assertThat(creditHit.decision().behavior())
+        .isEqualTo(FaultBehavior.RESPONSE_LOST_AFTER_PROCESSING);
+
+    assertThatThrownBy(
+            () ->
+                new FaultRule(
+                    "bad-behavior",
+                    "bank-b",
+                    FaultType.DELAY,
+                    50,
+                    1.0,
+                    null,
+                    null,
+                    "CREDIT",
+                    FaultBehavior.RESPONSE_LOST_AFTER_PROCESSING))
+        .isInstanceOf(IllegalArgumentException.class);
+  }
 }

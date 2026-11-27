@@ -15,6 +15,7 @@ import io.github.mhnuk2007.finsim.registry.Network;
 import io.github.mhnuk2007.finsim.registry.Registry;
 import io.github.mhnuk2007.finsim.registry.RegistryException;
 import io.github.mhnuk2007.finsim.registry.RegistryExceptions;
+import io.github.mhnuk2007.finsim.sim.FaultBehavior;
 import io.github.mhnuk2007.finsim.sim.FaultDecision;
 import io.github.mhnuk2007.finsim.sim.FaultType;
 import io.github.mhnuk2007.finsim.transfer.TransferDtos.CreateTransferRequest;
@@ -819,7 +820,7 @@ public class TransferOrchestrator {
     Instant callAt = clock.instant();
 
     if (faultService != null) {
-      FaultDecision decision = faultService.evaluateOutboundCall(targetInstitutionId);
+      FaultDecision decision = faultService.evaluateOutboundCall(targetInstitutionId, stage);
       if (decision.triggered()) {
         if (traceRecorder != null) {
           String faultId =
@@ -830,6 +831,10 @@ public class TransferOrchestrator {
               transactionId, stage, targetInstitutionId, faultId, clock.instant());
         }
         if (decision.faultType() == FaultType.TIMEOUT) {
+          if (decision.behavior() == FaultBehavior.RESPONSE_LOST_AFTER_PROCESSING) {
+            // Forward the payment leg so the participant processes it, then drop the response.
+            participantClient.applyLeg(baseUrl, idempotencyKey, payload);
+          }
           long durationMs = System.currentTimeMillis() - start;
           PaymentCallOutcome outcome =
               PaymentCallOutcome.timedOut(

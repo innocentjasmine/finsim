@@ -28,7 +28,8 @@ import picocli.CommandLine.Spec;
       FinSimCli.Transfer.class,
       FinSimCli.Trace.class,
       FinSimCli.Resolve.class,
-      FinSimCli.Fault.class
+      FinSimCli.Fault.class,
+      ScenarioCommand.class
     })
 public class FinSimCli implements Runnable {
 

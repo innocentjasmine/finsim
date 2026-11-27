@@ -8,6 +8,8 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
@@ -80,7 +82,8 @@ class FinSimCliTest {
             "transfer",
             "trace",
             "resolve",
-            "fault")) {
+            "fault",
+            "scenario")) {
       Result result = run(subcommand, "--help");
       assertThat(result.exit()).isZero();
       assertThat(result.out()).contains("Usage: finsim " + subcommand);
@@ -525,5 +528,251 @@ class FinSimCliTest {
 
     assertThat(result.exit()).isEqualTo(CommandLine.ExitCode.USAGE);
     assertThat(result.err()).contains("Fault rule ID is required");
+  }
+
+  @Test
+  void scenarioRunAndVerifyReplayPassesForValidYaml(@org.junit.jupiter.api.io.TempDir Path tmpDir)
+      throws Exception {
+    Path scenario = tmpDir.resolve("scenario.yaml");
+    Files.writeString(
+        scenario,
+        """
+        version: "finsim/scenario/v1"
+        name: "cli-replay-test"
+        network: "sandbox"
+        seed: 424242
+        participants:
+          - id: "bank-a"
+            accounts:
+              - reference: "ACC-1"
+                initialBalance: "500.00"
+                currency: "USD"
+          - id: "bank-b"
+            accounts:
+              - reference: "ACC-2"
+                initialBalance: "100.00"
+                currency: "USD"
+        faultRules:
+          - id: "fault-timeout-bank-b-credit"
+            target: "bank-b"
+            stage: "CREDIT"
+            type: "TIMEOUT"
+            behavior: "RESPONSE_LOST_AFTER_PROCESSING"
+            times: 1
+        steps:
+          - step: 1
+            action: "TRANSFER"
+            transactionId: "tx-cli-001"
+            idempotencyKey: "idem-cli-001"
+            from: "bank-a:ACC-1"
+            to: "bank-b:ACC-2"
+            amount: "50.00"
+            currency: "USD"
+            expectedState: "UNKNOWN"
+            expectedPendingAction: "RETRY_CREDIT"
+          - step: 2
+            action: "RESOLVE"
+            transactionId: "tx-cli-001"
+            expectedState: "COMPLETED"
+        assertions:
+          balances:
+            - account: "bank-a:ACC-1"
+              expectedBalance: "450.00"
+            - account: "bank-b:ACC-2"
+              expectedBalance: "150.00"
+        """);
+
+    Result result = run("scenario", "run", scenario.toString(), "--verify-replay");
+    assertThat(result.exit()).isZero();
+    assertThat(result.out())
+        .contains("cli-replay-test")
+        .contains("bank-a:ACC-1 = 450.00")
+        .contains("Replay verification PASSED")
+        .contains("Scenario & Replay Verification PASSED");
+
+    Result jsonResult = run("scenario", "run", scenario.toString(), "--verify-replay", "--json");
+    assertThat(jsonResult.exit()).isZero();
+    assertThat(jsonResult.out())
+        .contains("\"replayVerified\":true")
+        .contains("\"replayEquivalent\":true")
+        .contains("\"passed\":true");
+  }
+
+  @Test
+  void scenarioRunRejectsBadFlagsAndFailedAssertions(@org.junit.jupiter.api.io.TempDir Path tmpDir)
+      throws Exception {
+    Path badBalance = tmpDir.resolve("bad-balance.yaml");
+    Files.writeString(
+        badBalance,
+        """
+        version: "finsim/scenario/v1"
+        name: "cli-fail-test"
+        network: "sandbox"
+        seed: 100
+        participants:
+          - id: "bank-a"
+            accounts:
+              - reference: "ACC-1"
+                initialBalance: "100.00"
+                currency: "USD"
+          - id: "bank-b"
+            accounts:
+              - reference: "ACC-2"
+                initialBalance: "0.00"
+                currency: "USD"
+        steps:
+          - step: 1
+            action: "TRANSFER"
+            from: "bank-a:ACC-1"
+            to: "bank-b:ACC-2"
+            amount: "10.00"
+            currency: "USD"
+            expectedState: "COMPLETED"
+        assertions:
+          balances:
+            - account: "bank-a:ACC-1"
+              expectedBalance: "999.00"
+        """);
+
+    Result failed = run("scenario", "run", badBalance.toString());
+    assertThat(failed.exit()).isEqualTo(FinSimCli.EXIT_FAILED);
+    assertThat(failed.out()).contains("Balance assertion failed");
+
+    Result conflictingFlags =
+        run("scenario", "run", badBalance.toString(), "--live", "--verify-replay");
+    assertThat(conflictingFlags.exit()).isEqualTo(CommandLine.ExitCode.USAGE);
+    assertThat(conflictingFlags.err()).contains("cannot be combined with --live");
+  }
+
+  @Test
+  void scenarioRunLiveModeEnforcesStageRuleGuardAndExecutesAgainstRestApi(
+      @org.junit.jupiter.api.io.TempDir Path tmpDir) throws Exception {
+    Path stagedScenario = tmpDir.resolve("staged.yaml");
+    Files.writeString(
+        stagedScenario,
+        """
+        version: "finsim/scenario/v1"
+        name: "staged-live-guard"
+        network: "sandbox"
+        seed: 10
+        participants:
+          - id: "bank-a"
+            accounts: [{ reference: "ACC-1", initialBalance: "100.00", currency: "USD" }]
+          - id: "bank-b"
+            accounts: [{ reference: "ACC-2", initialBalance: "0.00", currency: "USD" }]
+        faultRules:
+          - id: "f-stage"
+            target: "bank-b"
+            stage: "CREDIT"
+            type: "TIMEOUT"
+        steps:
+          - step: 1
+            action: "TRANSFER"
+            from: "bank-a:ACC-1"
+            to: "bank-b:ACC-2"
+            amount: "10.00"
+            currency: "USD"
+        """);
+
+    Result stageRejected = run("scenario", "run", stagedScenario.toString(), "--live");
+    assertThat(stageRejected.exit()).isEqualTo(CommandLine.ExitCode.USAGE);
+    assertThat(stageRejected.err()).contains("only supported in isolated scenario runs");
+
+    Path liveScenario = tmpDir.resolve("live.yaml");
+    Files.writeString(
+        liveScenario,
+        """
+        version: "finsim/scenario/v1"
+        name: "live-ok"
+        network: "sandbox"
+        seed: 11
+        participants:
+          - id: "bank-a"
+            accounts: [{ reference: "ACC-1", initialBalance: "100.00", currency: "USD" }]
+          - id: "bank-b"
+            accounts: [{ reference: "ACC-2", initialBalance: "0.00", currency: "USD" }]
+        faultRules:
+          - id: "f-live"
+            target: "bank-b"
+            type: "TIMEOUT"
+            times: 1
+        steps:
+          - step: 1
+            action: "TRANSFER"
+            from: "bank-a:ACC-1"
+            to: "bank-b:ACC-2"
+            amount: "10.00"
+            currency: "USD"
+            expectedState: "UNKNOWN"
+            expectedPendingAction: "RETRY_CREDIT"
+          - step: 2
+            action: "RESOLVE"
+            expectedState: "COMPLETED"
+        assertions:
+          trace:
+            mustIncludeEvents:
+              - kind: "FAULT_INJECTED"
+                faultId: "f-live"
+              - kind: "STATE_CHANGE"
+                toState: "COMPLETED"
+        """);
+
+    List<String> calls = new java.util.concurrent.CopyOnWriteArrayList<>();
+    AtomicReference<String> faultPostBody = new AtomicReference<>();
+    server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+    server.createContext(
+        "/",
+        exchange -> {
+          String route = exchange.getRequestMethod() + " " + exchange.getRequestURI().getPath();
+          calls.add(route);
+          String resp;
+          int code;
+          if ("POST /api/v1/faults".equals(route)) {
+            faultPostBody.set(
+                new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            code = 201;
+            resp = "{\"faultId\":\"srv-uuid-1234\",\"target\":\"bank-b\",\"type\":\"TIMEOUT\"}";
+          } else if ("POST /api/v1/networks/sandbox/transfers".equals(route)) {
+            code = 201;
+            resp =
+                "{\"transactionId\":\"tx-live-1\",\"state\":\"UNKNOWN\",\"pendingAction\":\"RETRY_CREDIT\"}";
+          } else if ("POST /api/v1/transfers/tx-live-1/resolve".equals(route)) {
+            code = 200;
+            resp =
+                "{\"transactionId\":\"tx-live-1\",\"state\":\"COMPLETED\",\"pendingAction\":\"NONE\"}";
+          } else if ("GET /api/v1/transfers/tx-live-1/trace".equals(route)) {
+            code = 200;
+            resp =
+                "{\"transactionId\":\"tx-live-1\",\"events\":[{\"kind\":\"FAULT_INJECTED\",\"stage\":\"credit_destination\",\"target\":\"bank-b\",\"faultId\":\"srv-uuid-1234\"},{\"kind\":\"STATE_CHANGE\",\"stage\":\"resolve_credit\",\"fromState\":\"UNKNOWN\",\"toState\":\"COMPLETED\"}]}";
+          } else if ("DELETE /api/v1/faults/srv-uuid-1234".equals(route)) {
+            code = 204;
+            resp = "";
+          } else {
+            code = 404;
+            resp = "{}";
+          }
+          byte[] bytes = resp.getBytes(StandardCharsets.UTF_8);
+          exchange.getResponseHeaders().add("Content-Type", "application/json");
+          exchange.sendResponseHeaders(code, code == 204 ? -1 : bytes.length);
+          if (code != 204) {
+            exchange.getResponseBody().write(bytes);
+          }
+          exchange.close();
+        });
+    server.start();
+    String baseUrl = "http://localhost:" + server.getAddress().getPort();
+
+    Result liveOk = run("scenario", "run", liveScenario.toString(), "--live", "--finsim", baseUrl);
+    assertThat(liveOk.exit()).isZero();
+    assertThat(liveOk.out()).contains("Scenario PASSED.");
+    assertThat(faultPostBody.get()).doesNotContain("\"faultId\"");
+    assertThat(calls)
+        .contains(
+            "POST /api/v1/faults",
+            "POST /api/v1/networks/sandbox/transfers",
+            "POST /api/v1/transfers/tx-live-1/resolve",
+            "GET /api/v1/transfers/tx-live-1/trace",
+            "DELETE /api/v1/faults/srv-uuid-1234")
+        .doesNotContain("DELETE /api/v1/faults/f-live");
   }
 }

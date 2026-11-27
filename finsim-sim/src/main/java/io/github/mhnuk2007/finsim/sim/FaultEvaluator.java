@@ -1,6 +1,7 @@
 package io.github.mhnuk2007.finsim.sim;
 
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -8,6 +9,16 @@ import java.util.concurrent.ConcurrentHashMap;
 
 /** Framework-independent engine for evaluating fault rules against outbound participant calls. */
 public class FaultEvaluator {
+
+  private static final Map<String, String> STAGE_ALIASES =
+      Map.of(
+          "DEBIT", "DEBIT",
+          "DEBIT_SOURCE", "DEBIT",
+          "CREDIT", "CREDIT",
+          "CREDIT_DESTINATION", "CREDIT",
+          "RESOLVE_CREDIT", "CREDIT",
+          "REVERSAL", "REVERSAL",
+          "RESOLVE_REVERSAL", "REVERSAL");
 
   private final Map<String, DeterministicRandom> prngs = new ConcurrentHashMap<>();
 
@@ -20,18 +31,34 @@ public class FaultEvaluator {
   }
 
   /**
-   * Evaluates the first active matching rule for the given target institution.
+   * Evaluates the first active matching rule for the given target institution across all stages.
    *
    * @param rules the configured active rules to evaluate
    * @param targetInstitution the destination institution slug
    * @return the evaluation result containing the decision and updated rule if triggered
    */
   public synchronized EvaluationResult evaluate(List<FaultRule> rules, String targetInstitution) {
+    return evaluate(rules, targetInstitution, null);
+  }
+
+  /**
+   * Evaluates the first active matching rule for the given target institution and workflow stage.
+   *
+   * @param rules the configured active rules to evaluate
+   * @param targetInstitution the destination institution slug
+   * @param stage optional outbound workflow stage or leg (e.g. DEBIT, CREDIT, credit_destination)
+   * @return the evaluation result containing the decision and updated rule if triggered
+   */
+  public synchronized EvaluationResult evaluate(
+      List<FaultRule> rules, String targetInstitution, String stage) {
     Objects.requireNonNull(rules, "rules must not be null");
     Objects.requireNonNull(targetInstitution, "targetInstitution must not be null");
 
     for (FaultRule rule : rules) {
       if (!rule.target().equalsIgnoreCase(targetInstitution)) {
+        continue;
+      }
+      if (!matchesStage(rule.stage(), stage)) {
         continue;
       }
       if (!rule.isActive()) {
@@ -51,6 +78,30 @@ public class FaultEvaluator {
     }
 
     return EvaluationResult.none();
+  }
+
+  private static boolean matchesStage(String ruleStage, String callStage) {
+    if (ruleStage == null || ruleStage.isBlank()) {
+      return true;
+    }
+    if (callStage == null || callStage.isBlank()) {
+      return false;
+    }
+    if (ruleStage.equalsIgnoreCase(callStage)) {
+      return true;
+    }
+    // Canonical aliases allow DSL rules (e.g. stage: CREDIT) to match orchestrator
+    // stages
+    // (credit_destination, resolve_credit), while specific rule stages remain
+    // exact.
+    String normalizedRule = ruleStage.trim().toUpperCase(Locale.ROOT);
+    if (normalizedRule.equals("DEBIT")
+        || normalizedRule.equals("CREDIT")
+        || normalizedRule.equals("REVERSAL")) {
+      String canonicalCall = STAGE_ALIASES.get(callStage.trim().toUpperCase(Locale.ROOT));
+      return normalizedRule.equals(canonicalCall);
+    }
+    return false;
   }
 
   private boolean shouldTrigger(FaultRule rule) {

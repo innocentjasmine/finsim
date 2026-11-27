@@ -1,0 +1,56 @@
+version: "finsim/scenario/v1"
+name: "lost-credit-timeout-and-recovery"
+description: "Simulates destination timeout on credit leg where the response was lost after processing, testing ADR 0001 forward resolution"
+network: "sandbox"
+seed: 424242
+
+participants:
+  - id: "bank-a"
+    accounts:
+      - reference: "ACC-1"
+        initialBalance: "500.00"
+        currency: "USD"
+  - id: "bank-b"
+    accounts:
+      - reference: "ACC-2"
+        initialBalance: "100.00"
+        currency: "USD"
+
+faultRules:
+  - id: "fault-timeout-bank-b-credit"
+    target: "bank-b"
+    stage: "CREDIT"
+    type: "TIMEOUT"
+    behavior: "RESPONSE_LOST_AFTER_PROCESSING"
+    times: 1
+
+steps:
+  - step: 1
+    action: "TRANSFER"
+    transactionId: "tx-scenario-001"
+    idempotencyKey: "idem-key-001"
+    from: "bank-a:ACC-1"
+    to: "bank-b:ACC-2"
+    amount: "50.00"
+    currency: "USD"
+    expectedState: "UNKNOWN"
+    expectedPendingAction: "RETRY_CREDIT"
+  - step: 2
+    action: "RESOLVE"
+    transactionId: "tx-scenario-001"
+    expectedState: "COMPLETED"
+
+assertions:
+  balances:
+    - account: "bank-a:ACC-1"
+      expectedBalance: "450.00"
+    - account: "bank-b:ACC-2"
+      expectedBalance: "150.00"
+  trace:
+    mustIncludeEvents:
+      - kind: "FAULT_INJECTED"
+        faultId: "fault-timeout-bank-b-credit"
+      - kind: "STATE_CHANGE"
+        toState: "UNKNOWN"
+      - kind: "STATE_CHANGE"
+        toState: "COMPLETED"

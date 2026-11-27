@@ -3,6 +3,7 @@ plugins {
 }
 
 dependencies {
+    implementation(project(":finsim-sim"))
     implementation(libs.picocli)
 }
 

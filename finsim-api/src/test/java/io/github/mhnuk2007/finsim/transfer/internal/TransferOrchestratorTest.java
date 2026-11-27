@@ -19,11 +19,20 @@ import io.github.mhnuk2007.finsim.core.StageEntry;
 import io.github.mhnuk2007.finsim.core.StageOutcome;
 import io.github.mhnuk2007.finsim.core.Transfer;
 import io.github.mhnuk2007.finsim.core.TransferState;
+import io.github.mhnuk2007.finsim.faults.FaultService;
 import io.github.mhnuk2007.finsim.registry.Capability;
 import io.github.mhnuk2007.finsim.registry.Institution;
 import io.github.mhnuk2007.finsim.registry.InstitutionStatus;
 import io.github.mhnuk2007.finsim.registry.InstitutionType;
+import io.github.mhnuk2007.finsim.registry.Network;
 import io.github.mhnuk2007.finsim.registry.Registry;
+import io.github.mhnuk2007.finsim.sim.FaultBehavior;
+import io.github.mhnuk2007.finsim.sim.FaultDecision;
+import io.github.mhnuk2007.finsim.sim.FaultRule;
+import io.github.mhnuk2007.finsim.sim.FaultType;
+import io.github.mhnuk2007.finsim.transfer.TransferDtos.AccountRefDto;
+import io.github.mhnuk2007.finsim.transfer.TransferDtos.CreateTransferRequest;
+import io.github.mhnuk2007.finsim.transfer.TransferDtos.MoneyDto;
 import io.github.mhnuk2007.finsim.transfer.internal.ParticipantClient.LegResponsePayload;
 import io.github.mhnuk2007.finsim.transfer.internal.ParticipantClient.PaymentCallOutcome;
 import java.time.Clock;
@@ -173,6 +182,93 @@ class TransferOrchestratorTest {
     assertThat(resolved.getState()).isEqualTo(TransferState.UNKNOWN);
     assertThat(resolved.getReasonCode()).isNull();
     verify(persistenceHelper, times(1)).persistTransfer(transfer);
+  }
+
+  @Test
+  @DisplayName(
+      "Issue #26: RESPONSE_LOST_AFTER_PROCESSING forwards participant leg before timing out to UNKNOWN")
+  void orchestrateResponseLostAfterProcessingForwardsLegThenTimesOut() {
+    FaultService faultService = mock(FaultService.class);
+    TransferTraceRecorder traceRecorder = mock(TransferTraceRecorder.class);
+    TransferOrchestrator faultAwareOrchestrator =
+        new TransferOrchestrator(
+            registry,
+            participantClient,
+            persistenceHelper,
+            traceRecorder,
+            faultService,
+            Clock.fixed(NOW, ZoneOffset.UTC));
+
+    Institution bankA =
+        new Institution(
+            "bank-a",
+            "Bank A",
+            InstitutionType.BANK,
+            "http://bank-a:9001",
+            Set.of(Capability.ACCOUNT_DEBIT, Capability.ACCOUNT_CREDIT, Capability.STATUS_QUERY),
+            InstitutionStatus.ACTIVE,
+            "SYNTHETIC");
+    Institution bankB =
+        new Institution(
+            "bank-b",
+            "Bank B",
+            InstitutionType.BANK,
+            "http://bank-b:9002",
+            Set.of(Capability.ACCOUNT_DEBIT, Capability.ACCOUNT_CREDIT, Capability.STATUS_QUERY),
+            InstitutionStatus.ACTIVE,
+            "SYNTHETIC");
+    when(registry.requireRoutable("sandbox", "bank-a", Capability.ACCOUNT_DEBIT)).thenReturn(bankA);
+    when(registry.requireRoutable("sandbox", "bank-b", Capability.ACCOUNT_CREDIT))
+        .thenReturn(bankB);
+    when(registry.network("sandbox"))
+        .thenReturn(
+            new Network(
+                "sandbox",
+                "FinSim Sandbox",
+                Set.of("USD"),
+                Set.of("bank-a", "bank-b"),
+                null,
+                "SYNTHETIC"));
+
+    FaultRule creditLostRule =
+        new FaultRule(
+            "fault-credit-lost",
+            "bank-b",
+            FaultType.TIMEOUT,
+            null,
+            1.0,
+            1,
+            42L,
+            "CREDIT",
+            FaultBehavior.RESPONSE_LOST_AFTER_PROCESSING);
+    when(faultService.evaluateOutboundCall("bank-a", "debit_source"))
+        .thenReturn(FaultDecision.none());
+    when(faultService.evaluateOutboundCall("bank-b", "credit_destination"))
+        .thenReturn(FaultDecision.timeout(creditLostRule));
+
+    when(participantClient.applyLeg(eq("http://bank-a:9001"), eq("tx-26-1-debit"), any()))
+        .thenReturn(PaymentCallOutcome.completed("deb-ok"));
+    when(participantClient.applyLeg(eq("http://bank-b:9002"), eq("tx-26-1-credit"), any()))
+        .thenReturn(PaymentCallOutcome.completed("cred-ok-but-lost"));
+
+    Transfer result =
+        faultAwareOrchestrator.orchestrate(
+            "tx-26-1",
+            "sandbox",
+            "idemp-26-1",
+            new CreateTransferRequest(
+                new AccountRefDto("bank-a", "ACC-1"),
+                new AccountRefDto("bank-b", "ACC-2"),
+                new MoneyDto("50.00", "USD"),
+                "REF-26"));
+
+    assertThat(result.getState()).isEqualTo(TransferState.UNKNOWN);
+    assertThat(result.getPendingAction()).isEqualTo(PendingAction.RETRY_CREDIT);
+    // Crucial: credit call WAS delivered to bank-b despite resulting in simulated TIMEOUT.
+    verify(participantClient).applyLeg(eq("http://bank-b:9002"), eq("tx-26-1-credit"), any());
+    verify(traceRecorder)
+        .recordFaultInjected(
+            eq("tx-26-1"), eq("credit_destination"), eq("bank-b"), eq("fault-credit-lost"), any());
   }
 
   private static Transfer reconstituteUnknown(

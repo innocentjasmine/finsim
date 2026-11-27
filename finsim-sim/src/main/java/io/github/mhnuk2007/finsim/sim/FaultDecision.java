@@ -21,4 +21,13 @@ public record FaultDecision(
   public static FaultDecision duplicateDelivery(FaultRule rule) {
     return new FaultDecision(true, rule, FaultType.DUPLICATE_DELIVERY, 0);
   }
+
+  /**
+   * Returns the transport behavior associated with the matched rule, defaulting before processing.
+   */
+  public FaultBehavior behavior() {
+    return matchedRule != null && matchedRule.behavior() != null
+        ? matchedRule.behavior()
+        : FaultBehavior.BEFORE_PROCESSING;
+  }
 }
