@@ -142,6 +142,11 @@ class ScenarioHttpAdapterTest {
     }
 
     @Override
+    public StepOutcome executeAdvanceTime(ScenarioDefinition.StepSpec step) {
+      return delegate.executeAdvanceTime(step);
+    }
+
+    @Override
     public Map<String, BigDecimal> balances() {
       return delegate.balances();
     }

@@ -4,6 +4,7 @@ import io.github.mhnuk2007.finsim.sim.ScenarioDefinition.FaultRuleSpec;
 import io.github.mhnuk2007.finsim.sim.ScenarioDefinition.StepAction;
 import io.github.mhnuk2007.finsim.sim.ScenarioDefinition.StepSpec;
 import java.math.BigDecimal;
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -53,11 +54,13 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
   public record LegQueryResult(
       String status, String reasonCode, String participantReference, Map<String, Object> rawBody) {}
 
+  private final Clock wallClock = Clock.systemUTC();
   private final List<FaultRule> faultRules = new ArrayList<>();
   private final FaultEvaluator faultEvaluator = new FaultEvaluator();
   private final Map<String, TransferRecord> transfersById = new HashMap<>();
   private final Map<String, TransferRecord> transfersByKey = new HashMap<>();
   private final List<TraceEvent> traceEvents = new ArrayList<>();
+  private VirtualClock virtualClock = VirtualClock.create();
   private String networkId;
 
   @Override
@@ -68,11 +71,100 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
     transfersByKey.clear();
     traceEvents.clear();
     this.networkId = scenario.network();
+    this.virtualClock = VirtualClock.at(scenario.effectiveStartTime());
 
     for (FaultRuleSpec ruleSpec : scenario.faultRules()) {
       faultRules.add(ruleSpec.toFaultRule(scenario.seed()));
     }
     onInitialize(scenario);
+  }
+
+  /** Returns the deterministic simulation virtual clock for the current scenario run. */
+  public final VirtualClock virtualClock() {
+    return virtualClock;
+  }
+
+  /** Wall-clock UTC instant used for host telemetry ({@code TraceEvent.at}). */
+  protected final Instant wallNow() {
+    return wallClock.instant();
+  }
+
+  /** Deterministic virtual simulation instant ({@code TraceEvent.virtualAt}). */
+  protected final Instant virtualNow() {
+    return virtualClock.now();
+  }
+
+  /** Records a {@code STAGE} event stamped with both wall and virtual clocks. */
+  protected final void recordStage(String transferId, String stage) {
+    traceEvents.add(TraceEvent.stage(transferId, stage, wallNow()).withVirtualAt(virtualNow()));
+  }
+
+  /** Records a {@code STATE_CHANGE} event stamped with both wall and virtual clocks. */
+  protected final void recordStateChange(
+      String transferId, String stage, String fromState, String toState) {
+    traceEvents.add(
+        TraceEvent.stateChange(transferId, stage, fromState, toState, wallNow())
+            .withVirtualAt(virtualNow()));
+  }
+
+  /**
+   * Advances virtual simulation time according to {@code step} without sleeping the thread and
+   * records a deterministic {@code TIME_ADVANCED} trace event.
+   */
+  @Override
+  public StepOutcome executeAdvanceTime(StepSpec step) {
+    if (step.action() != StepAction.ADVANCE_TIME) {
+      throw new ScenarioValidationException(
+          "Step %d cannot execute %s as ADVANCE_TIME.".formatted(step.step(), step.action()));
+    }
+    Instant previousVirtual = virtualClock.now();
+    Instant callAt = wallNow();
+    long startNs = System.nanoTime();
+    int firedCount;
+    try {
+      firedCount =
+          step.advanceBy() != null
+              ? virtualClock.advanceBy(step.advanceBy())
+              : virtualClock.advanceTo(step.advanceTo());
+    } catch (IllegalArgumentException e) {
+      throw new ScenarioValidationException(
+          "Step %d ADVANCE_TIME invalid: %s".formatted(step.step(), e.getMessage()), e);
+    }
+    long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
+    Instant currentVirtual = virtualClock.now();
+    Map<String, Object> requestDetails = new LinkedHashMap<>();
+    requestDetails.put("previousVirtualTime", previousVirtual.toString());
+    requestDetails.put("virtualNow", currentVirtual.toString());
+    if (step.advanceBy() != null) {
+      requestDetails.put("advanceBy", step.advanceBy().toString());
+    }
+    if (step.advanceTo() != null) {
+      requestDetails.put("advanceTo", step.advanceTo().toString());
+    }
+    requestDetails.put("firedScheduledEvents", firedCount);
+
+    String stepTargetId = "step-" + step.step();
+    traceEvents.add(
+        TraceEvent.stage(stepTargetId, "advance_time", callAt).withVirtualAt(currentVirtual));
+    traceEvents.add(
+        new TraceEvent(
+            stepTargetId,
+            callAt,
+            "TIME_ADVANCED",
+            "advance_time",
+            "virtual-clock",
+            null,
+            null,
+            requestDetails,
+            Map.of("virtualNow", currentVirtual.toString(), "firedEvents", firedCount),
+            durationMs,
+            null,
+            null,
+            null,
+            Thread.currentThread().threadId(),
+            currentVirtual));
+    return new StepOutcome(
+        step.step(), StepAction.ADVANCE_TIME, stepTargetId, null, "ADVANCED", "NONE", null, false);
   }
 
   protected abstract void onInitialize(ScenarioDefinition scenario);
@@ -176,23 +268,19 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
       transfer.state = "REJECTED";
       transfer.reasonCode = debitOutcome.reasonCode();
       transfer.pendingAction = "NONE";
-      traceEvents.add(
-          TraceEvent.stateChange(
-              transactionId, "debit_source", "IN_PROGRESS", "REJECTED", Instant.now()));
+      recordStateChange(transactionId, "debit_source", "IN_PROGRESS", "REJECTED");
       return transfer.toStepOutcome(step.step(), StepAction.TRANSFER);
     }
     if ("TIMED_OUT".equals(debitOutcome.status())) {
       transfer.state = "UNKNOWN";
       transfer.pendingAction = "NONE";
-      traceEvents.add(
-          TraceEvent.stateChange(
-              transactionId, "debit_source", "IN_PROGRESS", "UNKNOWN", Instant.now()));
+      recordStateChange(transactionId, "debit_source", "IN_PROGRESS", "UNKNOWN");
       return transfer.toStepOutcome(step.step(), StepAction.TRANSFER);
     }
 
     confirmDebitOnce(transfer);
 
-    traceEvents.add(TraceEvent.stage(transactionId, "credit_destination", Instant.now()));
+    recordStage(transactionId, "credit_destination");
     String creditKey = transactionId + "-credit";
     Map<String, Object> creditReq =
         legRequest(
@@ -211,24 +299,18 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
         confirmCreditOnce(transfer);
         transfer.state = "COMPLETED";
         transfer.pendingAction = "NONE";
-        traceEvents.add(
-            TraceEvent.stateChange(
-                transactionId, "credit_destination", "IN_PROGRESS", "COMPLETED", Instant.now()));
+        recordStateChange(transactionId, "credit_destination", "IN_PROGRESS", "COMPLETED");
       }
       case "TIMED_OUT" -> {
         transfer.state = "UNKNOWN";
         transfer.pendingAction = "RETRY_CREDIT";
-        traceEvents.add(
-            TraceEvent.stateChange(
-                transactionId, "credit_destination", "IN_PROGRESS", "UNKNOWN", Instant.now()));
+        recordStateChange(transactionId, "credit_destination", "IN_PROGRESS", "UNKNOWN");
       }
       case "REJECTED" -> {
         transfer.state = "UNKNOWN";
         transfer.pendingAction = "REVERSE_DEBIT";
         transfer.pendingReversalReason = creditOutcome.reasonCode();
-        traceEvents.add(
-            TraceEvent.stateChange(
-                transactionId, "credit_destination", "IN_PROGRESS", "UNKNOWN", Instant.now()));
+        recordStateChange(transactionId, "credit_destination", "IN_PROGRESS", "UNKNOWN");
         executeReversal(transfer, creditOutcome.reasonCode());
       }
       default ->
@@ -300,7 +382,7 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
       return transfer.toStepOutcome(step.step(), StepAction.RESOLVE);
     }
 
-    traceEvents.add(TraceEvent.stage(transactionId, "resolve_credit", Instant.now()));
+    recordStage(transactionId, "resolve_credit");
     Map<String, Object> creditReq =
         legRequest(
             transactionId,
@@ -318,9 +400,7 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
         confirmCreditOnce(transfer);
         transfer.state = "COMPLETED";
         transfer.pendingAction = "NONE";
-        traceEvents.add(
-            TraceEvent.stateChange(
-                transactionId, "resolve_credit", "UNKNOWN", "COMPLETED", Instant.now()));
+        recordStateChange(transactionId, "resolve_credit", "UNKNOWN", "COMPLETED");
       }
       case "TIMED_OUT" -> transfer.pendingAction = "RETRY_CREDIT";
       case "REJECTED" -> executeReversal(transfer, resend.reasonCode());
@@ -357,7 +437,7 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
   }
 
   private void executeReversal(TransferRecord transfer, String rejectionReason) {
-    traceEvents.add(TraceEvent.stage(transfer.transactionId, "resolve_reversal", Instant.now()));
+    recordStage(transfer.transactionId, "resolve_reversal");
     String destReason = nonBlankOr(rejectionReason, "REJECTED");
     String revId = transfer.transactionId + "-rev";
     Map<String, Object> revReq =
@@ -378,9 +458,7 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
         transfer.reasonCode = destReason;
         transfer.pendingAction = "NONE";
         transfer.needsManualReview = false;
-        traceEvents.add(
-            TraceEvent.stateChange(
-                transfer.transactionId, "resolve_reversal", "UNKNOWN", "REJECTED", Instant.now()));
+        recordStateChange(transfer.transactionId, "resolve_reversal", "UNKNOWN", "REJECTED");
       }
       case "TIMED_OUT" -> {
         transfer.pendingAction = "REVERSE_DEBIT";
@@ -404,7 +482,8 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
       String idempotencyKey,
       Map<String, Object> payload) {
     long startNs = System.nanoTime();
-    Instant callAt = Instant.now();
+    Instant callAt = wallNow();
+    Instant callVirtualAt = virtualNow();
     String endpoint = paymentEndpointForTrace(targetInst);
 
     FaultEvaluator.EvaluationResult eval = faultEvaluator.evaluate(faultRules, targetInst, stage);
@@ -427,7 +506,8 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
               ? decision.matchedRule().faultId()
               : decision.faultType().name();
       traceEvents.add(
-          TraceEvent.faultInjected(transferId, stage, targetInst, faultId, Instant.now()));
+          TraceEvent.faultInjected(transferId, stage, targetInst, faultId, wallNow())
+              .withVirtualAt(virtualNow()));
 
       if (decision.faultType() == FaultType.TIMEOUT) {
         if (decision.behavior() == FaultBehavior.RESPONSE_LOST_AFTER_PROCESSING) {
@@ -439,15 +519,16 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
                 "Simulated " + decision.behavior() + " timeout on target " + targetInst);
         traceEvents.add(
             TraceEvent.outboundCall(
-                transferId,
-                stage,
-                targetInst,
-                "POST",
-                endpoint,
-                payload,
-                timedOut.toTraceMap(),
-                durationMs,
-                callAt));
+                    transferId,
+                    stage,
+                    targetInst,
+                    "POST",
+                    endpoint,
+                    payload,
+                    timedOut.toTraceMap(),
+                    durationMs,
+                    callAt)
+                .withVirtualAt(callVirtualAt));
         return timedOut;
       }
 
@@ -458,15 +539,16 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
         LegDispatchResult first = dispatchPaymentLeg(targetInst, idempotencyKey, payload, false, 0);
         traceEvents.add(
             TraceEvent.outboundCall(
-                transferId,
-                stage,
-                targetInst,
-                "POST",
-                endpoint,
-                payload,
-                first.toTraceMap(),
-                0L,
-                callAt));
+                    transferId,
+                    stage,
+                    targetInst,
+                    "POST",
+                    endpoint,
+                    payload,
+                    first.toTraceMap(),
+                    0L,
+                    callAt)
+                .withVirtualAt(callVirtualAt));
       }
     }
 
@@ -475,37 +557,40 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
     long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
     traceEvents.add(
         TraceEvent.outboundCall(
-            transferId,
-            stage,
-            targetInst,
-            "POST",
-            endpoint,
-            payload,
-            outcome.toTraceMap(),
-            durationMs,
-            callAt));
+                transferId,
+                stage,
+                targetInst,
+                "POST",
+                endpoint,
+                payload,
+                outcome.toTraceMap(),
+                durationMs,
+                callAt)
+            .withVirtualAt(callVirtualAt));
     return outcome;
   }
 
   private Optional<LegQueryResult> queryLeg(
       String transferId, String stage, String targetInst, String legTxId, String direction) {
-    traceEvents.add(TraceEvent.stage(transferId, stage, Instant.now()));
+    recordStage(transferId, stage);
     String endpoint = statusEndpointForTrace(targetInst, legTxId, direction);
     long startNs = System.nanoTime();
-    Instant callAt = Instant.now();
+    Instant callAt = wallNow();
+    Instant callVirtualAt = virtualNow();
     Optional<LegQueryResult> res = fetchLegStatus(targetInst, legTxId, direction);
     long durationMs = (System.nanoTime() - startNs) / 1_000_000L;
     traceEvents.add(
         TraceEvent.outboundCall(
-            transferId,
-            stage,
-            targetInst,
-            "GET",
-            endpoint,
-            Map.of("transactionId", legTxId, "leg", direction),
-            res.map(LegQueryResult::rawBody).orElse(null),
-            durationMs,
-            callAt));
+                transferId,
+                stage,
+                targetInst,
+                "GET",
+                endpoint,
+                Map.of("transactionId", legTxId, "leg", direction),
+                res.map(LegQueryResult::rawBody).orElse(null),
+                durationMs,
+                callAt)
+            .withVirtualAt(callVirtualAt));
     return res;
   }
 
@@ -532,9 +617,11 @@ public abstract class BaseScenarioExecutor implements ScenarioExecutor {
 
   private void recordStageAndTransition(
       String transferId, String stage, String fromState, String toState) {
-    Instant now = Instant.now();
-    traceEvents.add(TraceEvent.stage(transferId, stage, now));
-    traceEvents.add(TraceEvent.stateChange(transferId, stage, fromState, toState, now));
+    Instant now = wallNow();
+    Instant vNow = virtualNow();
+    traceEvents.add(TraceEvent.stage(transferId, stage, now).withVirtualAt(vNow));
+    traceEvents.add(
+        TraceEvent.stateChange(transferId, stage, fromState, toState, now).withVirtualAt(vNow));
   }
 
   @Override

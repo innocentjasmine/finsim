@@ -74,6 +74,7 @@ public final class ReplayComparator {
     diffField(index, "faultId", e1.faultId(), e2.faultId(), diffs);
     diffField(index, "fromState", e1.fromState(), e2.fromState(), diffs);
     diffField(index, "toState", e1.toState(), e2.toState(), diffs);
+    diffField(index, "virtualAt", e1.virtualAt(), e2.virtualAt(), diffs);
   }
 
   private static void diffField(int index, String field, Object v1, Object v2, List<String> diffs) {

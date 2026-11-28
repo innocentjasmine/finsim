@@ -122,6 +122,15 @@ final class ScenarioCommand implements Runnable {
           return CommandLine.ExitCode.USAGE;
         }
       }
+      for (StepSpec step : scenario.steps()) {
+        if (step.action() == StepAction.ADVANCE_TIME) {
+          err.println(
+              "Step "
+                  + step.step()
+                  + " uses ADVANCE_TIME, which is only supported in offline/in-memory simulation (not --live).");
+          return CommandLine.ExitCode.USAGE;
+        }
+      }
 
       FinSimClient client = connection.client();
       List<String> createdFaultIds = new ArrayList<>();
@@ -205,7 +214,7 @@ final class ScenarioCommand implements Runnable {
             lastTxId = outcome.transactionId();
             ScenarioRunner.verifyStepExpectations(step, outcome, failures);
             fetchTraceEvents(client, lastTxId, collectedTrace);
-          } else {
+          } else if (step.action() == StepAction.RESOLVE) {
             String txId = step.transactionId() != null ? step.transactionId() : lastTxId;
             if (txId == null) {
               err.println("Step " + step.step() + " RESOLVE could not determine transactionId.");

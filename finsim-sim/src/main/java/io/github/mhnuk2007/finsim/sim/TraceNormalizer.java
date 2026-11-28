@@ -66,7 +66,8 @@ public final class TraceNormalizer {
         hashPayload(event.response()),
         event.faultId(),
         event.fromState(),
-        event.toState());
+        event.toState(),
+        event.virtualAt());
   }
 
   /** Strips scheme/host/ephemeral port when a full URL was recorded, preserving path + query. */

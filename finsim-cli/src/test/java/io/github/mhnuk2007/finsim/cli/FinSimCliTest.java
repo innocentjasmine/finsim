@@ -804,4 +804,48 @@ class FinSimCliTest {
             "DELETE /api/v1/faults/srv-uuid-1234")
         .doesNotContain("DELETE /api/v1/faults/f-live");
   }
+
+  @Test
+  void scenarioRunSupportsAdvanceTimeInReplayAndRejectsAdvanceTimeInLiveMode(
+      @org.junit.jupiter.api.io.TempDir Path tmpDir) throws Exception {
+    Path timeScenario = tmpDir.resolve("time-travel.yaml");
+    Files.writeString(
+        timeScenario,
+        """
+        version: "finsim/scenario/v1"
+        name: "cli-virtual-clock"
+        network: "sandbox"
+        seed: 27
+        startTime: "2026-01-01T00:00:00Z"
+        participants:
+          - id: "bank-a"
+            accounts:
+              - reference: "ACC-1"
+                initialBalance: "200.00"
+                currency: "USD"
+          - id: "bank-b"
+            accounts:
+              - reference: "ACC-2"
+                initialBalance: "0.00"
+                currency: "USD"
+        steps:
+          - step: 1
+            action: "TRANSFER"
+            from: "bank-a:ACC-1"
+            to: "bank-b:ACC-2"
+            amount: "25.00"
+            currency: "USD"
+          - step: 2
+            action: "ADVANCE_TIME"
+            advanceBy: "P7D"
+        """);
+
+    Result replayOk = run("scenario", "run", timeScenario.toString(), "--verify-replay");
+    assertThat(replayOk.exit()).isZero();
+    assertThat(replayOk.out()).contains("Scenario & Replay Verification PASSED.");
+
+    Result liveRejected = run("scenario", "run", timeScenario.toString(), "--live");
+    assertThat(liveRejected.exit()).isEqualTo(CommandLine.ExitCode.USAGE);
+    assertThat(liveRejected.err()).contains("ADVANCE_TIME").contains("not --live");
+  }
 }
