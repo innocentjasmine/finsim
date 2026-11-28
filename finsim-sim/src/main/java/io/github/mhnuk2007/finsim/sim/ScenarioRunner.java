@@ -135,6 +135,9 @@ public final class ScenarioRunner {
               : DeterministicIdGenerator.derive(scenario.seed(), step.step());
       return executor.executeTransfer(step, txId, idempKey);
     }
+    if (step.action() == StepAction.ADVANCE_TIME) {
+      return executor.executeAdvanceTime(step);
+    }
 
     String targetTxId = step.transactionId();
     if (targetTxId == null && step.targetStep() != null) {

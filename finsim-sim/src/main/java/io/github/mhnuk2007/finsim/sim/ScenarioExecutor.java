@@ -28,6 +28,11 @@ public interface ScenarioExecutor {
 
   StepOutcome executeResolve(ScenarioDefinition.StepSpec step, String transactionId);
 
+  default StepOutcome executeAdvanceTime(ScenarioDefinition.StepSpec step) {
+    throw new UnsupportedOperationException(
+        "ADVANCE_TIME is not supported by " + getClass().getSimpleName());
+  }
+
   Map<String, BigDecimal> balances();
 
   List<TraceEvent> trace();

@@ -1,6 +1,8 @@
 package io.github.mhnuk2007.finsim.sim;
 
 import java.math.BigDecimal;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Objects;
 
@@ -14,12 +16,36 @@ public record ScenarioDefinition(
     String description,
     String network,
     long seed,
+    Instant startTime,
     List<ParticipantSpec> participants,
     List<FaultRuleSpec> faultRules,
     List<StepSpec> steps,
     AssertionsSpec assertions) {
 
   public static final String SUPPORTED_VERSION = "finsim/scenario/v1";
+
+  public ScenarioDefinition(
+      String version,
+      String name,
+      String description,
+      String network,
+      long seed,
+      List<ParticipantSpec> participants,
+      List<FaultRuleSpec> faultRules,
+      List<StepSpec> steps,
+      AssertionsSpec assertions) {
+    this(
+        version,
+        name,
+        description,
+        network,
+        seed,
+        null,
+        participants,
+        faultRules,
+        steps,
+        assertions);
+  }
 
   public ScenarioDefinition {
     if (!SUPPORTED_VERSION.equals(version)) {
@@ -43,6 +69,11 @@ public record ScenarioDefinition(
       throw new ScenarioValidationException("Scenario must declare at least one step.");
     }
     assertions = assertions != null ? assertions : AssertionsSpec.empty();
+  }
+
+  /** Returns configured virtual clock start time or {@link Instant#EPOCH} by default. */
+  public Instant effectiveStartTime() {
+    return startTime != null ? startTime : Instant.EPOCH;
   }
 
   public record ParticipantSpec(String id, List<AccountSpec> accounts) {
@@ -134,7 +165,8 @@ public record ScenarioDefinition(
 
   public enum StepAction {
     TRANSFER,
-    RESOLVE
+    RESOLVE,
+    ADVANCE_TIME
   }
 
   public record AccountEndpoint(String institutionId, String accountReference) {
@@ -176,7 +208,41 @@ public record ScenarioDefinition(
       String reference,
       String expectedState,
       String expectedPendingAction,
-      String expectedReasonCode) {
+      String expectedReasonCode,
+      Duration advanceBy,
+      Instant advanceTo) {
+
+    public StepSpec(
+        int step,
+        StepAction action,
+        String transactionId,
+        String idempotencyKey,
+        Integer targetStep,
+        AccountEndpoint from,
+        AccountEndpoint to,
+        BigDecimal amount,
+        String currency,
+        String reference,
+        String expectedState,
+        String expectedPendingAction,
+        String expectedReasonCode) {
+      this(
+          step,
+          action,
+          transactionId,
+          idempotencyKey,
+          targetStep,
+          from,
+          to,
+          amount,
+          currency,
+          reference,
+          expectedState,
+          expectedPendingAction,
+          expectedReasonCode,
+          null,
+          null);
+    }
 
     public StepSpec {
       if (step < 1) {
@@ -196,6 +262,25 @@ public record ScenarioDefinition(
           throw new ScenarioValidationException(
               "Step %d TRANSFER requires 3-letter uppercase 'currency'.".formatted(step));
         }
+      }
+      if (action == StepAction.ADVANCE_TIME) {
+        if ((advanceBy == null) == (advanceTo == null)) {
+          throw new ScenarioValidationException(
+              "Step %d ADVANCE_TIME requires exactly one of 'advanceBy' or 'advanceTo'."
+                  .formatted(step));
+        }
+        if (advanceBy != null && (advanceBy.isZero() || advanceBy.isNegative())) {
+          throw new ScenarioValidationException(
+              "Step %d ADVANCE_TIME 'advanceBy' must be strictly positive.".formatted(step));
+        }
+        if (from != null || to != null || amount != null || currency != null) {
+          throw new ScenarioValidationException(
+              "Step %d ADVANCE_TIME must not specify transfer fields (from/to/amount/currency)."
+                  .formatted(step));
+        }
+      } else if (advanceBy != null || advanceTo != null) {
+        throw new ScenarioValidationException(
+            "Step %d %s must not specify 'advanceBy' or 'advanceTo'.".formatted(step, action));
       }
       if (idempotencyKey != null
           && (idempotencyKey.length() < 8 || idempotencyKey.length() > 128)) {

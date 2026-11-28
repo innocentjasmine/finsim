@@ -21,7 +21,11 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -45,6 +49,7 @@ public final class ScenarioParser {
           "description",
           "network",
           "seed",
+          "startTime",
           "participants",
           "faultRules",
           "steps",
@@ -69,7 +74,9 @@ public final class ScenarioParser {
           "reference",
           "expectedState",
           "expectedPendingAction",
-          "expectedReasonCode");
+          "expectedReasonCode",
+          "advanceBy",
+          "advanceTo");
   private static final Set<String> ASSERTIONS_FIELDS = Set.of("balances", "trace");
   private static final Set<String> BALANCE_ASSERTION_FIELDS = Set.of("account", "expectedBalance");
   private static final Set<String> TRACE_ASSERTIONS_FIELDS = Set.of("mustIncludeEvents");
@@ -128,16 +135,26 @@ public final class ScenarioParser {
     String description = optionalText(rootObj, "description", "scenario");
     String network = requireText(rootObj, "network", "scenario");
     long seed = requireLong(rootObj, "seed", "scenario");
+    Instant startTime = optionalInstant(rootObj, "startTime", "scenario");
 
     List<ParticipantSpec> participants = parseParticipants(rootObj.get("participants"));
     List<FaultRuleSpec> faultRules = parseFaultRules(rootObj.get("faultRules"));
     List<StepSpec> steps = parseSteps(rootObj.get("steps"), seed);
     AssertionsSpec assertions = parseAssertions(rootObj.get("assertions"));
 
-    validateReferences(participants, steps, assertions);
+    validateReferences(startTime, participants, steps, assertions);
 
     return new ScenarioDefinition(
-        version, name, description, network, seed, participants, faultRules, steps, assertions);
+        version,
+        name,
+        description,
+        network,
+        seed,
+        startTime,
+        participants,
+        faultRules,
+        steps,
+        assertions);
   }
 
   private static List<ParticipantSpec> parseParticipants(JsonNode node) {
@@ -255,6 +272,8 @@ public final class ScenarioParser {
       BigDecimal amount = null;
       String currency = null;
       String reference = optionalText(obj, "reference", ctx);
+      Duration advanceBy = optionalDuration(obj, "advanceBy", ctx);
+      Instant advanceTo = optionalInstant(obj, "advanceTo", ctx);
       if (action == StepAction.TRANSFER) {
         from = AccountEndpoint.parse(requireText(obj, "from", ctx), ctx + ".from");
         to = AccountEndpoint.parse(requireText(obj, "to", ctx), ctx + ".to");
@@ -265,6 +284,18 @@ public final class ScenarioParser {
         }
         if (idempotencyKey == null) {
           idempotencyKey = DeterministicIdGenerator.derive(scenarioSeed, stepNum);
+        }
+      } else if (action == StepAction.ADVANCE_TIME) {
+        if (obj.hasNonNull("from")
+            || obj.hasNonNull("to")
+            || obj.hasNonNull("amount")
+            || obj.hasNonNull("currency")
+            || transactionId != null
+            || idempotencyKey != null
+            || targetStep != null) {
+          throw new ScenarioValidationException(
+              "Step %d ADVANCE_TIME must not specify transfer or resolve fields."
+                  .formatted(stepNum));
         }
       }
 
@@ -286,7 +317,9 @@ public final class ScenarioParser {
               reference,
               expectedState,
               expectedPendingAction,
-              expectedReasonCode));
+              expectedReasonCode,
+              advanceBy,
+              advanceTo));
     }
     return steps;
   }
@@ -358,12 +391,18 @@ public final class ScenarioParser {
   }
 
   private static void validateReferences(
-      List<ParticipantSpec> participants, List<StepSpec> steps, AssertionsSpec assertions) {
+      Instant startTime,
+      List<ParticipantSpec> participants,
+      List<StepSpec> steps,
+      AssertionsSpec assertions) {
     Set<String> participantIds = new HashSet<>();
     for (ParticipantSpec p : participants) {
       participantIds.add(p.id());
     }
-    for (StepSpec step : steps) {
+    Instant cursor = startTime != null ? startTime : Instant.EPOCH;
+    List<StepSpec> orderedSteps =
+        steps.stream().sorted(Comparator.comparingInt(StepSpec::step)).toList();
+    for (StepSpec step : orderedSteps) {
       if (step.action() == StepAction.RESOLVE && step.transactionId() == null) {
         if (step.targetStep() == null) {
           boolean hasPrecedingTransfer =
@@ -386,6 +425,18 @@ public final class ScenarioParser {
           throw new ScenarioValidationException(
               "Step %d references undeclared 'to' participant '%s'."
                   .formatted(step.step(), step.to().institutionId()));
+        }
+      }
+      if (step.action() == StepAction.ADVANCE_TIME) {
+        if (step.advanceBy() != null) {
+          cursor = cursor.plus(step.advanceBy());
+        } else if (step.advanceTo() != null) {
+          if (step.advanceTo().isBefore(cursor)) {
+            throw new ScenarioValidationException(
+                "Step %d ADVANCE_TIME target '%s' precedes current virtual time '%s'."
+                    .formatted(step.step(), step.advanceTo(), cursor));
+          }
+          cursor = step.advanceTo();
         }
       }
     }
@@ -431,6 +482,36 @@ public final class ScenarioParser {
           "Field '%s.%s' must be a string.".formatted(ctx, field));
     }
     return node.asText().isBlank() ? null : node.asText();
+  }
+
+  private static Duration optionalDuration(ObjectNode obj, String field, String ctx) {
+    String raw = optionalText(obj, field, ctx);
+    if (raw == null) {
+      return null;
+    }
+    try {
+      return Duration.parse(raw.trim());
+    } catch (DateTimeParseException e) {
+      throw new ScenarioValidationException(
+          "Field '%s.%s' must be a valid ISO-8601 duration (e.g. PT5S, P1D), got '%s'."
+              .formatted(ctx, field, raw),
+          e);
+    }
+  }
+
+  private static Instant optionalInstant(ObjectNode obj, String field, String ctx) {
+    String raw = optionalText(obj, field, ctx);
+    if (raw == null) {
+      return null;
+    }
+    try {
+      return Instant.parse(raw.trim());
+    } catch (DateTimeParseException e) {
+      throw new ScenarioValidationException(
+          "Field '%s.%s' must be a valid ISO-8601 UTC instant (e.g. 2026-01-01T00:00:00Z), got '%s'."
+              .formatted(ctx, field, raw),
+          e);
+    }
   }
 
   private static BigDecimal requireDecimalString(ObjectNode obj, String field, String ctx) {

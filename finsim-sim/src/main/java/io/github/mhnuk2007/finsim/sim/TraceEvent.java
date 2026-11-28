@@ -21,7 +21,60 @@ public record TraceEvent(
     String faultId,
     String fromState,
     String toState,
-    Long threadId) {
+    Long threadId,
+    Instant virtualAt) {
+
+  public TraceEvent(
+      String transferId,
+      Instant at,
+      String kind,
+      String stage,
+      String target,
+      String httpMethod,
+      String requestPath,
+      Object request,
+      Object response,
+      Long durationMs,
+      String faultId,
+      String fromState,
+      String toState,
+      Long threadId) {
+    this(
+        transferId,
+        at,
+        kind,
+        stage,
+        target,
+        httpMethod,
+        requestPath,
+        request,
+        response,
+        durationMs,
+        faultId,
+        fromState,
+        toState,
+        threadId,
+        null);
+  }
+
+  public TraceEvent withVirtualAt(Instant virtualAt) {
+    return new TraceEvent(
+        transferId,
+        at,
+        kind,
+        stage,
+        target,
+        httpMethod,
+        requestPath,
+        request,
+        response,
+        durationMs,
+        faultId,
+        fromState,
+        toState,
+        threadId,
+        virtualAt);
+  }
 
   public static TraceEvent stage(String transferId, String stage, Instant at) {
     return new TraceEvent(
