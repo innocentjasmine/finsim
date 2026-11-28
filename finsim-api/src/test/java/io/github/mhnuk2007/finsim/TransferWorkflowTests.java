@@ -414,10 +414,10 @@ class TransferWorkflowTests {
                 new ParticipantClient.LegResponsePayload(
                     txId, "CREDIT", "REJECTED", "AC04", "cred-rej", "SYNTHETIC")));
 
-    // Reversal call to source bank-a with key:rev and reversalOf:txId
+    // Reversal call to source bank-a with key txId + "-rev" and reversalOf txId
     when(participantClient.applyLeg(
             eq("http://localhost:9001"),
-            eq(key + ":rev"),
+            eq(txId + "-rev"),
             argThat(
                 req ->
                     txId.equals(req.reversalOf()) && (txId + "-rev").equals(req.transactionId()))))
@@ -429,6 +429,13 @@ class TransferWorkflowTests {
     assertThat(JsonPath.<String>read(resolveRes.body(), "$.reasonCode")).isEqualTo("AC04");
     assertThat(JsonPath.<String>read(resolveRes.body(), "$.emittedBy")).isEqualTo("DESTINATION");
     assertThat(JsonPath.<Boolean>read(resolveRes.body(), "$.needsManualReview")).isFalse();
+    verify(participantClient)
+        .applyLeg(
+            eq("http://localhost:9001"),
+            eq(txId + "-rev"),
+            argThat(
+                req ->
+                    txId.equals(req.reversalOf()) && (txId + "-rev").equals(req.transactionId())));
   }
 
   @Test
